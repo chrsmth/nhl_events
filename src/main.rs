@@ -5,6 +5,7 @@ use serde_json;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time;
+use tokio_cron_scheduler::{Job, JobScheduler};
 use tokio_stream::wrappers::IntervalStream;
 use url::Url;
 
@@ -13,20 +14,25 @@ static NHL_SCHEDULE_ENDPOINT: &str = "/api/v1/schedule"; //TODO make into lazy s
 static NHL_TEAMS_ENDPOINT: &str = "/api/v1/teams";
 
 #[derive(Debug)]
-struct Schedule {
+struct DaySchedule {
     date: NaiveDate,
+    games: Vec<Game>,
+}
+
+#[derive(Debug)]
+struct Schedule {
     games: Vec<Game>,
 }
 
 #[derive(Debug)]
 struct Game {
     date_time: DateTime<Utc>,
-    game_pk: f32,
+    game_pk: u32,
     home: TeamId,
     away: TeamId,
 }
 
-type TeamId = f32;
+type TeamId = u32;
 
 #[derive(Debug)]
 struct Teams {
@@ -34,73 +40,96 @@ struct Teams {
     teams: HashMap<TeamId, String>,
 }
 
-async fn get_schedule(date: chrono::NaiveDate) -> Schedule {
-    let previous_date = date.clone().checked_sub_days(Days::new(1)).unwrap();
-    let next_date = date.clone().checked_add_days(Days::new(1)).unwrap();
-    let start_date_formatted = previous_date.format("%Y-%m-%d").to_string();
-    let end_date_formatted = next_date.format("%Y-%m-%d").to_string();
-    let mut request_url = Url::parse(API_BASE).unwrap();
-    request_url
-        .path_segments_mut()
-        .unwrap()
-        .push("api")
-        .push("v1")
-        .push("schedule");
-    request_url
-        .query_pairs_mut()
-        .append_pair("startDate", &start_date_formatted)
-        .append_pair("endDate", &end_date_formatted);
-    let response = reqwest::get(request_url).await.unwrap();
-    let json = response.text().await.unwrap();
-    let schedule_api: openapi::models::Schedule = serde_json::from_str(json.as_str()).unwrap();
-
-    let mut games: Vec<Game> = Vec::new();
-    for date in schedule_api.dates.unwrap() {
-        for game_api in date.games.unwrap() {
-            if game_api.status.unwrap().abstract_game_state.unwrap() == "Final" {
-                continue;
-            }
-
-            games.push(Game {
-                date_time: DateTime::from(
-                    DateTime::parse_from_rfc3339(&game_api.game_date.unwrap()).unwrap(),
-                ),
-                game_pk: game_api.game_pk.unwrap(),
-                home: game_api
-                    .teams
-                    .as_ref()
-                    .and_then(|teams| teams.home.as_ref())
-                    .and_then(|home| home.team.as_ref())
-                    .and_then(|team| team.id)
-                    .unwrap(),
-                away: game_api
-                    .teams
-                    .as_ref()
-                    .and_then(|teams| teams.away.as_ref())
-                    .and_then(|away| away.team.as_ref())
-                    .and_then(|team| team.id)
-                    .unwrap(),
-            });
-        }
+impl Schedule {
+    fn new() -> Schedule {
+        Schedule { games: Vec::new() }
     }
 
-    Schedule { date, games }
+    pub async fn sync_today(&mut self) {
+        let now = Utc::now();
+        let yesterday = now.clone().checked_sub_days(Days::new(1)).unwrap();
+        let tomorrow = now.clone().checked_add_days(Days::new(1)).unwrap();
+
+        let mut request = Url::parse(API_BASE).unwrap();
+        request
+            .path_segments_mut()
+            .unwrap()
+            .push("api")
+            .push("v1")
+            .push("schedule");
+        request
+            .query_pairs_mut()
+            .append_pair("startDate", &yesterday.format("%Y-%m-%d").to_string())
+            .append_pair("endDate", &tomorrow.format("%Y-%m-%d").to_string());
+
+        let response = reqwest::get(request).await.unwrap();
+        let json = response.text().await.unwrap();
+        let schedule_model: openapi::models::Schedule =
+            serde_json::from_str(json.as_str()).unwrap();
+
+        for date in schedule_model.dates.unwrap() {
+            for game_api in date.games.unwrap() {
+                let game_status = game_api
+                    .status
+                    .as_ref()
+                    .and_then(|x| x.abstract_game_state.as_ref())
+                    .unwrap();
+                if game_status == "Final" {
+                    continue;
+                }
+
+                let game = Game::try_from(game_api.clone()).unwrap();
+                self.games.push(game);
+            }
+        }
+    }
 }
 
-//async fn get_score(game_pk: f32) -> (u32, u32) {
-//(0, 0)
-//}
+impl TryFrom<openapi::models::ScheduleGame> for Game {
+    type Error = String;
 
-async fn game_loop() {}
+    fn try_from(schedule_game: openapi::models::ScheduleGame) -> Result<Self, Self::Error> {
+        let time = schedule_game.game_date.unwrap();
+        let pk = schedule_game.game_pk.unwrap() as u32;
+        let teams = schedule_game.teams.unwrap();
+        let home_id = teams
+            .home
+            .and_then(|x| x.team)
+            .and_then(|x| x.id)
+            .unwrap()
+            .trunc() as u32;
+        let away_id = teams
+            .away
+            .and_then(|x| x.team)
+            .and_then(|x| x.id)
+            .unwrap()
+            .trunc() as u32;
+
+        Ok(Game {
+            date_time: DateTime::from(DateTime::parse_from_rfc3339(&time).unwrap()),
+            game_pk: pk,
+            home: home_id,
+            away: away_id,
+        })
+    }
+}
 
 async fn event_loop() {
     let mut interval = IntervalStream::new(time::interval(Duration::from_secs(1)));
-    let date_time = Utc::now();
-    let mut schedule = get_schedule(date_time.date_naive()).await;
+    let mut schedule = Schedule::new();
+    schedule.sync_today().await;
+    let sched = JobScheduler::new().await.unwrap();
+    let job = Job::new_async("* 0 0 * * *", move |_uuid, _l| {
+        schedule.sync_today();
+    })
+    .unwrap();
+    sched.add(job).await.unwrap();
+    sched.start().await.unwrap();
 
-    println!("{:#?}", schedule);
+    //println!("{:?}", schedule);
 
     while let Some(_) = interval.next().await {
+        /*
         let date_time = Utc::now();
 
         if schedule.date < date_time.date_naive() {
@@ -116,6 +145,7 @@ async fn event_loop() {
                 //game.home
             }
         }
+        */
 
         println!("whelp, triggered again!");
     }
